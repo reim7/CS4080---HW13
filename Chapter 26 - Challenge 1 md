@@ -1,0 +1,540 @@
+## Solution
+
+For this challenge, I followed the bit-packing
+approach from the uploaded suggested solution.
+
+The main idea is to combine the three fields
+of the Obj structure into a single 64-bit integer
+rather than storing each field separately.
+
+This could reduce memory usage for each
+heap-allocated object.
+
+However, it also introduces additional work
+when reading or updating the individual fields.
+
+## 1. Understanding the Original Obj Structure
+
+In Chapter 26, the Obj structure is defined
+in object.h as:
+
+```c
+struct sObj {
+  ObjType type;
+  bool isMarked;
+  struct Obj* next;
+};
+```
+
+Each field serves an important purpose.
+
+The type field identifies what kind of object
+is being stored, such as a string, function,
+closure, or upvalue.
+
+The isMarked field is used during garbage
+collection to record whether an object
+is reachable.
+
+The next pointer connects objects in the
+VM's linked list of heap-allocated objects.
+
+Together, these fields form the header
+that every clox object contains.
+
+## 2. How Much Memory Does the Header Use?
+
+According to the uploaded suggested solution,
+the original Obj structure occupies 16 bytes
+on the author's 64-bit Mac.
+
+Although the fields do not necessarily use
+16 bytes of actual data, the C compiler may
+insert padding to satisfy memory alignment
+requirements.
+
+For example, on a typical system with
+a four-byte enum and an eight-byte pointer:
+
+```text
+ObjType type       4 bytes
+bool isMarked      1 byte
+Padding            3 bytes
+Obj* next          8 bytes
+--------------------------
+Total             16 bytes
+```
+
+This is a typical memory layout, not a
+measurement from my own computer.
+
+The actual layout depends on the compiler,
+target architecture, and alignment rules.
+
+## 3. Measuring the Original Header Size
+
+To determine the actual size on a specific
+machine, I would compile and run the following
+small C program.
+
+The example assumes access to the clox
+object.h header.
+
+```c
+#include <stdio.h>
+#include <stddef.h>
+
+#include "object.h"
+
+int main(void) {
+  printf("Size of Obj: %zu bytes\n",
+         sizeof(Obj));
+
+  printf("Offset of type: %zu\n",
+         offsetof(Obj, type));
+
+  printf("Offset of isMarked: %zu\n",
+         offsetof(Obj, isMarked));
+
+  printf("Offset of next: %zu\n",
+         offsetof(Obj, next));
+
+  return 0;
+}
+```
+
+The sizeof operator reports the total
+structure size, including padding.
+
+The offsetof macro reports the location
+of each field within the structure.
+
+I have not run this program, so I cannot
+confirm the actual size on my machine.
+
+## 4. Proposed Optimization: Bit Packing
+
+The suggested solution proposes storing
+all three fields inside a uint64_t.
+
+On a system where the required pointer
+information fits within 48 bits, we can
+reserve different parts of the integer
+for the other fields.
+
+A possible layout is:
+
+```text
+Bits 63–56: Object type
+Bits 55–48: Mark information
+Bits 47–0:  Next-object pointer
+```
+
+This allocates:
+
+- 8 bits for the object type.
+- 8 bits for the mark information.
+- 48 bits for the pointer representation.
+
+Only one bit is actually required for
+the Boolean mark state, so most of its
+allocated byte remains unused.
+
+The suggested solution uses this design
+to reduce the header to a single
+64-bit integer.
+
+This approach relies on the assumption
+that the object's pointer can be safely
+represented using the chosen 48-bit
+portion.
+
+It is not portable to every 64-bit
+architecture or pointer representation.
+
+## 5. Modify the Obj Structure
+
+In object.h, the original structure is:
+
+```c
+struct sObj {
+  ObjType type;
+  bool isMarked;
+  struct Obj* next;
+};
+```
+
+The proposed replacement is:
+
+```c
+struct sObj {
+  uint64_t header;
+};
+```
+
+This requires including stdint.h.
+
+```c
+#include <stdint.h>
+```
+
+The new structure contains only one
+64-bit field.
+
+If uint64_t occupies eight bytes,
+sizeof(Obj) should also be eight
+bytes on the intended system.
+
+However, this still needs to be
+verified by compiling the code.
+
+## 6. Reading the Packed Fields
+
+Since the original fields no longer
+exist separately, clox cannot directly
+access object->type, object->isMarked,
+or object->next.
+
+Instead, accessor functions must
+extract the appropriate bits.
+
+In object.h, I would add:
+
+```c
+static inline ObjType objType(Obj* object) {
+  return (ObjType)((object->header >> 56) & 0xff);
+}
+
+static inline bool isMarked(Obj* object) {
+  return (bool)((object->header >> 48) & 0x01);
+}
+
+static inline Obj* objNext(Obj* object) {
+  return (Obj*)(uintptr_t)(
+      object->header & UINT64_C(0x0000ffffffffffff));
+}
+```
+
+These accessors use bitwise operators.
+
+The right-shift operator moves the
+desired field into the lower bits.
+
+The bitwise AND operator masks out
+the unrelated information.
+
+For example, objType() shifts the
+header by 56 bits to retrieve the
+object's type.
+
+The isMarked() function retrieves
+the bit representing the object's
+marking state.
+
+The objNext() function extracts
+the pointer representation.
+
+The pointer conversion is valid
+only if the original pointer can
+be recovered from those 48 bits.
+
+## 7. Updating the Packed Fields
+
+We also need setter functions.
+
+A setter must update its own field
+without changing the remaining
+information stored in the header.
+
+For the mark bit:
+
+```c
+static inline void setIsMarked(Obj* object,
+                               bool marked) {
+  object->header =
+      (object->header &
+       UINT64_C(0xfffeffffffffffff)) |
+      ((uint64_t)marked << 48);
+}
+```
+
+This clears the old mark bit and
+stores the new Boolean value.
+
+The object's type and pointer
+information remain unchanged.
+
+For the next pointer:
+
+```c
+static inline void setObjNext(Obj* object,
+                              Obj* next) {
+  uint64_t pointerBits =
+      (uint64_t)(uintptr_t)next;
+
+  object->header =
+      (object->header &
+       UINT64_C(0xffff000000000000)) |
+      (pointerBits &
+       UINT64_C(0x0000ffffffffffff));
+}
+```
+
+This preserves the upper fields
+and replaces the lower 48 bits
+containing the pointer.
+
+Again, the implementation assumes
+that the pointer's full information
+fits in those lower bits.
+
+If that assumption is false,
+truncating the pointer could
+cause invalid memory access.
+
+A production implementation would
+need platform-specific safeguards
+or a different encoding.
+
+## 8. Initialize the Packed Header
+
+In object.c, clox originally
+initializes a newly allocated
+object by assigning each field.
+
+For example:
+
+```c
+object->type = type;
+object->isMarked = false;
+object->next = vm.objects;
+```
+
+With the packed representation,
+the initialization becomes:
+
+```c
+uint64_t pointerBits =
+    (uint64_t)(uintptr_t)vm.objects;
+
+object->header =
+    ((uint64_t)type << 56) |
+    (pointerBits &
+     UINT64_C(0x0000ffffffffffff));
+```
+
+The type is stored in the upper
+eight bits.
+
+The initial mark bit is zero,
+which represents an unmarked object.
+
+The next pointer is stored in
+the lower 48 bits.
+
+The original linked-list behavior
+is preserved as long as the pointer
+encoding is valid.
+
+## 9. Update the Rest of clox
+
+After changing the Obj structure,
+all direct accesses to its original
+fields must be updated.
+
+For example:
+
+```c
+object->type
+```
+
+Becomes:
+
+```c
+objType(object)
+```
+
+And:
+
+```c
+object->isMarked
+```
+
+Becomes:
+
+```c
+isMarked(object)
+```
+
+Assignments such as:
+
+```c
+object->isMarked = true;
+```
+
+Become:
+
+```c
+setIsMarked(object, true);
+```
+
+Similarly:
+
+```c
+object->next
+```
+
+Becomes:
+
+```c
+objNext(object)
+```
+
+Assignments to the next pointer
+must use setObjNext().
+
+These changes would affect several
+parts of clox, including:
+
+- object.c and object.h
+- memory.c
+- vm.c
+- table.c where object fields are accessed
+- other code that directly reads the Obj header
+
+In particular, the marking and
+sweeping stages of garbage collection
+must use the new accessors.
+
+The object-type checks used by
+the interpreter must also be updated.
+
+## 10. Portability Considerations
+
+Although the suggested approach is
+compact, it is not universally portable.
+
+The main assumption is that object
+pointers can be stored and recovered
+using only 48 bits.
+
+This might work in a particular
+64-bit environment, but the C
+language does not guarantee that
+all valid pointers have this form.
+
+Some systems may use additional
+address bits, pointer tagging,
+or other pointer representations.
+
+Therefore, I would treat this as
+a platform-specific optimization.
+
+Before using it in a working VM,
+I would verify the pointer layout
+and confirm that no address
+information is lost.
+
+If the assumptions cannot be
+guaranteed, the original structure
+is safer.
+
+## 11. Potential Memory Savings
+
+The uploaded suggested solution
+reports a 16-byte original header
+and an 8-byte packed header on
+the author's target system.
+
+That corresponds to a reduction
+of 8 bytes per object header.
+
+However, the overall memory savings
+would depend on how many objects
+the program allocates.
+
+For example, if a program creates
+many small objects, reducing the
+header size could reduce its
+total memory usage.
+
+For larger objects, the header
+may represent a smaller fraction
+of the total allocation.
+
+The final effect may also depend
+on alignment and allocator behavior.
+
+These sizes are based on the
+proposed layout and the author's
+reported environment, not on
+independent measurements.
+
+## 12. Runtime Costs
+
+The main disadvantage of bit packing
+is that accessing fields becomes
+more complicated.
+
+Instead of reading a field directly,
+the VM must use masking and
+bit-shifting operations.
+
+Updating fields also requires
+preserving the other bits
+in the packed header.
+
+This introduces additional operations
+that may create runtime overhead.
+
+The object type is accessed frequently
+during normal execution.
+
+Therefore, making type access more
+complicated could affect more than
+just garbage collection.
+
+By comparison, the mark bit and
+next pointer are primarily used
+during memory management.
+
+The relative cost depends on
+compiler optimizations, hardware,
+and the program being executed.
+
+I have not run benchmarks, so I
+cannot determine the actual
+performance impact.
+
+## 13. Is This Optimization Worth It?
+
+I think the packed-header approach
+is an interesting way to reduce
+memory overhead.
+
+Its advantage is that every object
+could require less space for
+its shared header.
+
+This may be especially useful
+for programs that allocate many
+small objects.
+
+However, the implementation is
+less straightforward than storing
+the fields separately.
+
+It also depends on assumptions
+about pointer representations
+and requires changing existing
+object-access code.
+
+I would want to test memory usage,
+runtime performance, and pointer
+correctness before adopting
+the optimization.
+
+Without verified results,
+I would prefer the original
+portable structure for a
+general-purpose implementation.
