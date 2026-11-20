@@ -1,0 +1,767 @@
+## Solution
+
+For this challenge, I followed the mark-bit
+flipping technique from the uploaded
+suggested solution.
+
+The main idea is to change what the
+Boolean marking value means after each
+garbage collection cycle.
+
+Instead of having true always mean
+"marked" and false always mean
+"unmarked," the VM maintains a Boolean
+that tells us which value currently
+represents a marked object.
+
+After each garbage collection cycle,
+the VM flips that Boolean value.
+
+This means surviving objects automatically
+become logically unmarked for the next
+collection without having to update
+their individual marking fields.
+
+## 1. Understanding the Original Implementation
+
+In Chapter 26, clox uses a mark-and-sweep
+garbage collector.
+
+During the marking phase, the collector
+starts with the VM's roots and follows
+references to identify all reachable objects.
+
+Reachable objects are marked by setting:
+
+```c
+object->isMarked = true;
+```
+
+During sweeping, the collector checks
+whether each allocated object is marked.
+
+The original code includes:
+
+```c
+if (object->isMarked) {
+  object->isMarked = false;
+  previous = object;
+  object = object->next;
+} else {
+  // Remove and free unreachable objects.
+}
+```
+
+If an object is marked, the collector
+keeps it in memory.
+
+It also resets isMarked to false so
+the object can be marked again during
+the next garbage collection cycle.
+
+Although this works correctly, it
+requires a write to every surviving
+object during each sweep.
+
+I wanted to avoid those repeated writes.
+
+## 2. Add a Marking State to the VM
+
+The suggested solution introduces a
+new Boolean field in the VM structure.
+
+In vm.h, add:
+
+```c
+bool markValue;
+```
+
+This field defines which Boolean
+value currently means "marked."
+
+For example:
+
+```text
+vm.markValue = true
+```
+
+Means:
+
+```text
+Object mark = true   -> Marked
+Object mark = false  -> Unmarked
+```
+
+After the VM flips its markValue:
+
+```text
+vm.markValue = false
+```
+
+The meanings reverse:
+
+```text
+Object mark = false  -> Marked
+Object mark = true   -> Unmarked
+```
+
+The important point is that an
+object's marking state is determined
+by comparing its stored bit with
+the current VM marking value.
+
+We no longer assume that true
+always represents a marked object.
+
+## 3. Initialize the VM Marking Value
+
+In vm.c, initialize the new field
+inside initVM():
+
+```c
+vm.markValue = true;
+```
+
+This should happen before any
+allocation can trigger garbage
+collection or use the marking state.
+
+The initial value can be either
+true or false.
+
+I chose true because it matches
+the original implementation's
+meaning during the first collection.
+
+## 4. Rename the Object Marking Field
+
+In object.h, the original Obj
+structure contains:
+
+```c
+struct sObj {
+  ObjType type;
+  bool isMarked;
+  struct Obj* next;
+};
+```
+
+I would rename isMarked to mark:
+
+```c
+struct sObj {
+  ObjType type;
+  bool mark;
+  struct Obj* next;
+};
+```
+
+This makes the new behavior clearer.
+
+The field is no longer a Boolean
+that independently tells us whether
+the object is marked.
+
+Instead, its value must be compared
+with vm.markValue to determine the
+object's current marking state.
+
+## 5. Update Object Allocation
+
+In the original implementation,
+new objects start unmarked:
+
+```c
+object->isMarked = false;
+```
+
+With mark-bit flipping, false
+does not always mean unmarked.
+
+A new object must instead have a
+mark value opposite to the current
+VM marking value.
+
+In object.c, update allocateObject():
+
+```c
+static Obj* allocateObject(size_t size,
+                           ObjType type) {
+  Obj* object = (Obj*)reallocate(NULL, 0, size);
+
+  object->type = type;
+
+  // New objects begin logically unmarked.
+  object->mark = !vm.markValue;
+
+  object->next = vm.objects;
+  vm.objects = object;
+
+#ifdef DEBUG_LOG_GC
+  printf("%p allocate %zu for %d\n",
+         (void*)object, size, type);
+#endif
+
+  return object;
+}
+```
+
+The important change is:
+
+```c
+object->mark = !vm.markValue;
+```
+
+Regardless of whether the VM currently
+uses true or false to represent marked
+objects, newly allocated objects
+start in the unmarked state.
+
+## 6. Update markObject()
+
+The markObject() function determines
+whether a reachable object has already
+been marked.
+
+Originally, it checks:
+
+```c
+if (object->isMarked) return;
+```
+
+With the new approach, I would change
+this comparison to:
+
+```c
+if (object->mark == vm.markValue) return;
+```
+
+When marking an object, replace:
+
+```c
+object->isMarked = true;
+```
+
+With:
+
+```c
+object->mark = vm.markValue;
+```
+
+The relevant updated function in
+memory.c is:
+
+```c
+void markObject(Obj* object) {
+  if (object == NULL) return;
+
+  // Already marked in this collection.
+  if (object->mark == vm.markValue) return;
+
+#ifdef DEBUG_LOG_GC
+  printf("%p mark ", (void*)object);
+  printValue(OBJ_VAL(object));
+  printf("\n");
+#endif
+
+  // Mark the object using the current VM value.
+  object->mark = vm.markValue;
+
+  if (vm.grayCapacity < vm.grayCount + 1) {
+    vm.grayCapacity =
+        GROW_CAPACITY(vm.grayCapacity);
+
+    vm.grayStack = (Obj**)realloc(
+        vm.grayStack,
+        sizeof(Obj*) * vm.grayCapacity);
+
+    if (vm.grayStack == NULL) exit(1);
+  }
+
+  vm.grayStack[vm.grayCount++] = object;
+}
+```
+
+This preserves the original behavior
+of preventing an object from being
+processed more than once per collection.
+
+The only difference is how we determine
+whether the object is marked.
+
+## 7. Update the Weak String Table
+
+Chapter 26 explains that clox stores
+interned strings in a table.
+
+This table uses weak references because
+its entries should not prevent unreachable
+strings from being collected.
+
+Before sweeping, the VM removes entries
+for strings that are no longer reachable.
+
+In table.c, the original implementation
+checks:
+
+```c
+if (entry->key != NULL &&
+    !entry->key->obj.isMarked) {
+  tableDelete(table, entry->key);
+}
+```
+
+With the new marking convention,
+I would replace this with:
+
+```c
+if (entry->key != NULL &&
+    entry->key->obj.mark != vm.markValue) {
+  tableDelete(table, entry->key);
+}
+```
+
+The updated helper becomes:
+
+```c
+void tableRemoveWhite(Table* table) {
+  for (int i = 0; i < table->capacity; i++) {
+    Entry* entry = &table->entries[i];
+
+    if (entry->key != NULL &&
+        entry->key->obj.mark != vm.markValue) {
+      tableDelete(table, entry->key);
+    }
+  }
+}
+```
+
+This ensures that the string table
+continues removing unreachable strings
+even when the meaning of the mark
+bit changes between collections.
+
+This step is important because
+the string table must not keep
+dangling pointers to freed objects.
+
+## 8. Update the Sweep Phase
+
+This is the main optimization.
+
+In the original sweep() function,
+every surviving object has its
+isMarked field reset to false.
+
+With mark-bit flipping, that
+individual reset is unnecessary.
+
+In memory.c, the updated sweep()
+function becomes:
+
+```c
+static void sweep() {
+  Obj* previous = NULL;
+  Obj* object = vm.objects;
+
+  while (object != NULL) {
+    // Keep objects marked in this cycle.
+    if (object->mark == vm.markValue) {
+      previous = object;
+      object = object->next;
+    } else {
+      // Remove an unreachable object.
+      Obj* unreached = object;
+      object = object->next;
+
+      if (previous != NULL) {
+        previous->next = object;
+      } else {
+        vm.objects = object;
+      }
+
+      freeObject(unreached);
+    }
+  }
+}
+```
+
+Notice that the following assignment
+is no longer present:
+
+```c
+object->isMarked = false;
+```
+
+Instead, the collector only checks
+whether an object's mark matches
+the VM's current marking value.
+
+If the values match, the object
+was reached during marking and
+must be preserved.
+
+If they do not match, the object
+is unreachable and can be freed.
+
+The sweep phase continues to
+traverse the object list, but
+it no longer clears the marking
+field on each surviving object.
+
+## 9. Flip the Marking Value After Collection
+
+After the mark, trace, and sweep
+phases have finished, the VM can
+change which Boolean value
+represents a marked object.
+
+In memory.c, add the following
+line near the end of collectGarbage():
+
+```c
+vm.markValue = !vm.markValue;
+```
+
+The relevant sequence becomes:
+
+```c
+void collectGarbage() {
+#ifdef DEBUG_LOG_GC
+  printf("-- gc begin\n");
+  size_t before = vm.bytesAllocated;
+#endif
+
+  markRoots();
+  traceReferences();
+  tableRemoveWhite(&vm.strings);
+  sweep();
+
+  vm.nextGC =
+      vm.bytesAllocated * GC_HEAP_GROW_FACTOR;
+
+  // Prepare the next collection cycle.
+  vm.markValue = !vm.markValue;
+
+#ifdef DEBUG_LOG_GC
+  printf("-- gc end\n");
+  printf(
+      "   collected %zu bytes (from %zu to %zu)"
+      " next at %zu\n",
+      before - vm.bytesAllocated,
+      before,
+      vm.bytesAllocated,
+      vm.nextGC);
+#endif
+}
+```
+
+The timing of the flip is important.
+
+It must happen after sweeping because
+the current collection uses vm.markValue
+to determine which objects survived.
+
+If the meaning were reversed before
+sweeping finished, live objects
+could be incorrectly treated
+as unreachable.
+
+## 10. Why This Works
+
+Suppose the VM starts with:
+
+```text
+vm.markValue = true
+```
+
+During the first collection, the
+collector marks reachable objects
+by setting their mark field to true.
+
+After sweeping, every surviving
+object has:
+
+```text
+object->mark = true
+```
+
+At the end of the collection,
+the VM flips the meaning:
+
+```text
+vm.markValue = false
+```
+
+Now those same surviving objects
+are considered unmarked because:
+
+```text
+object->mark != vm.markValue
+```
+
+During the next collection, the
+collector marks reachable objects
+by setting their mark field to false.
+
+After that collection, the VM
+flips the marking value back
+to true.
+
+This repeats for every cycle.
+
+The collector never needs to
+reset the mark field on every
+surviving object individually.
+
+Instead, one Boolean update
+changes the meaning of every
+object's existing marking bit.
+
+## 11. Example of Two Collection Cycles
+
+The process can be summarized
+using this example:
+
+```text
+Collection 1:
+vm.markValue = true
+
+Object A is reachable:
+A.mark = true
+
+Object B is unreachable:
+B.mark = false
+
+Sweep:
+Keep A
+Free B
+
+End:
+vm.markValue = false
+```
+
+At the beginning of the next cycle:
+
+```text
+Collection 2:
+vm.markValue = false
+
+Object A begins logically unmarked:
+A.mark = true
+
+Mark A again:
+A.mark = false
+
+Sweep:
+Keep A
+
+End:
+vm.markValue = true
+```
+
+The same object survives both
+collections without requiring
+a separate reset after each sweep.
+
+## 12. Testing the Optimization
+
+To test the implementation,
+I would enable the garbage
+collector's debug flags.
+
+In common.h:
+
+```c
+#define DEBUG_STRESS_GC
+#define DEBUG_LOG_GC
+```
+
+DEBUG_STRESS_GC forces frequent
+garbage collection during allocations.
+
+DEBUG_LOG_GC prints information
+about marking, allocation,
+and garbage collection.
+
+This would help identify cases
+where objects are freed too early
+or accidentally retained.
+
+I would also run programs
+that create many temporary strings
+and closures.
+
+For example:
+
+```lox
+fun makeClosure(value) {
+  fun inner() {
+    return value;
+  }
+
+  return inner;
+}
+
+var saved = makeClosure("still alive");
+
+var i = 0;
+while (i < 1000) {
+  var temporary = "hello" + " world";
+  i = i + 1;
+}
+
+print saved();
+```
+
+Expected output:
+
+```text
+still alive
+```
+
+The string and closure captured
+by saved should remain reachable
+despite repeated allocations
+and garbage collection cycles.
+
+The test is intended to verify
+correct object reachability.
+
+It does not provide a
+performance measurement.
+
+## 13. Performance Considerations
+
+The main potential benefit of
+mark-bit flipping is that the
+collector no longer needs to
+write to the marking field
+of every surviving object
+during sweeping.
+
+Instead, it updates one
+Boolean field in the VM
+after each collection.
+
+This could reduce memory writes
+during the sweep phase,
+especially when many objects
+survive a collection.
+
+However, the collector must
+compare each object's marking
+value against the VM's
+current marking value.
+
+This comparison is required
+during marking, weak-reference
+cleanup, and sweeping.
+
+Therefore, the optimization
+changes the work performed
+by the collector rather than
+eliminating all marking overhead.
+
+I have not run performance
+benchmarks, so I cannot
+determine whether it
+improves collection speed
+or overall execution time.
+
+The actual results would depend
+on the program's allocation
+patterns, the number of
+surviving objects, and the
+system being used.
+
+## 14. Is the Optimization Worth It?
+
+I think this optimization
+is worth exploring because
+it avoids repeatedly modifying
+the marking field of every
+surviving object.
+
+The changes are also fairly
+localized to the memory
+management system.
+
+The main disadvantage is that
+the interpretation of the
+mark bit becomes less
+straightforward.
+
+Instead of checking whether
+isMarked is true, the VM
+must compare each object's
+mark field with vm.markValue.
+
+If even one part of the
+collector continues using
+the original Boolean
+interpretation, it could
+incorrectly mark or free
+objects.
+
+Therefore, consistency
+is especially important.
+
+Overall, I think this is
+a reasonable optimization,
+but I would want to
+benchmark it before
+claiming any performance
+benefit.
+
+## 15. Compatibility With Challenge 1
+
+Challenge 1 proposes replacing
+the Obj structure with a packed
+64-bit header.
+
+Challenge 2 instead assumes
+that the Obj structure has
+a separate Boolean mark field.
+
+If both challenges are
+implemented together,
+the two designs must be
+combined carefully.
+
+Rather than directly accessing
+object->mark, the collector
+would need to use the
+packed-header accessor
+and setter functions.
+
+For example, the logic
+would conceptually become:
+
+```c
+if (isMarked(object) == vm.markValue) {
+  // Object is marked in the current cycle.
+}
+```
+
+And marking would use:
+
+```c
+setIsMarked(object, vm.markValue);
+```
+
+New objects would begin with:
+
+```c
+setIsMarked(object, !vm.markValue);
+```
+
+The vm.markValue field
+would still be flipped
+after every collection.
+
+These are conceptual integration
+changes. The packed-header
+implementation also requires
+its own pointer-representation
+safety checks.
