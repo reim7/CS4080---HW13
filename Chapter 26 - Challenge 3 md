@@ -1,0 +1,693 @@
+## Solution
+
+For this challenge, I chose to explore reference
+counting as an alternative garbage collection
+technique.
+
+Chapter 26 implements a mark-and-sweep garbage
+collector that identifies reachable objects
+by tracing references from the VM's roots.
+
+Reference counting takes a different approach.
+
+Instead of waiting until a collection cycle
+to identify unused objects, reference counting
+tracks how many references point to each object.
+
+When an object's reference count reaches zero,
+the object may be reclaimed immediately.
+
+I would explore augmenting the existing clox
+collector with reference counting while retaining
+mark-and-sweep to handle cyclic references.
+
+The following code demonstrates the main
+mechanism and outlines the integration changes
+that would be required in clox.
+
+## 1. How Mark-and-Sweep Works
+
+In Chapter 26, clox uses mark-and-sweep.
+
+The collector performs the following steps:
+
+1. Identify roots, including VM stack values,
+   global variables, call frames, compiler
+   state, and open upvalues.
+2. Mark objects reachable from those roots.
+3. Traverse references between objects.
+4. Remove unreachable interned strings
+   from the weak string table.
+5. Sweep unreachable objects and reclaim
+   their memory.
+
+This algorithm can correctly collect
+unreachable object graphs, including cycles.
+
+However, it needs to revisit reachable
+objects during garbage collection.
+
+Reference counting offers a different
+way to determine when an object is unused.
+
+## 2. Understanding Reference Counting
+
+In reference counting, each object stores
+an integer representing the number of
+references that currently point to it.
+
+When a new owning reference is created,
+the count increases.
+
+When an owning reference is removed,
+the count decreases.
+
+If the count reaches zero, the object
+has no remaining tracked owners.
+
+Assuming all references are correctly
+tracked, the object can be released.
+
+For example:
+
+```text
+Create object A:
+
+A.referenceCount = 1
+
+Create another reference to A:
+
+A.referenceCount = 2
+
+Remove one reference:
+
+A.referenceCount = 1
+
+Remove the final reference:
+
+A.referenceCount = 0
+```
+
+At this point, the object can be
+reclaimed without waiting for a
+full mark-and-sweep collection.
+
+The difficult part is ensuring every
+owning reference is tracked correctly.
+
+## 3. Add a Reference Count to Obj
+
+The current Obj structure in Chapter 26
+contains:
+
+```c
+struct sObj {
+  ObjType type;
+  bool isMarked;
+  struct Obj* next;
+};
+```
+
+For an experimental reference-counted
+implementation, I would add a field:
+
+```c
+struct sObj {
+  ObjType type;
+  bool isMarked;
+  struct Obj* next;
+  size_t referenceCount;
+};
+```
+
+The new referenceCount field keeps
+track of references to the object.
+
+I would also include stddef.h if
+it is not already available:
+
+```c
+#include <stddef.h>
+```
+
+This approach increases the size
+of the object header.
+
+It is therefore a separate design
+from the packed-header optimization
+in Challenge 1.
+
+If both designs were combined,
+the reference count would need
+its own representation.
+
+## 4. Initialize Reference Counts
+
+In object.c, clox allocates objects
+using allocateObject().
+
+An experimental reference-counting
+version could initialize the new
+field as follows:
+
+```c
+static Obj* allocateObject(size_t size,
+                           ObjType type) {
+  Obj* object = (Obj*)reallocate(NULL, 0, size);
+
+  object->type = type;
+  object->isMarked = false;
+  object->referenceCount = 0;
+
+  object->next = vm.objects;
+  vm.objects = object;
+
+  return object;
+}
+```
+
+The reference count begins at zero
+because no owning reference has been
+registered yet.
+
+This is only safe if the allocation
+protocol immediately protects the
+new object before another garbage
+collection can occur.
+
+The original clox implementation
+already requires temporary rooting
+for objects that are being constructed.
+
+A complete reference-counting system
+would need a consistent ownership
+protocol for allocation and return
+values.
+
+## 5. Increment the Reference Count
+
+I would introduce a helper named
+retainObject().
+
+In memory.h:
+
+```c
+void retainObject(Obj* object);
+```
+
+A basic implementation in memory.c is:
+
+```c
+void retainObject(Obj* object) {
+  if (object == NULL) return;
+
+  object->referenceCount++;
+}
+```
+
+Whenever a new owning reference
+to an object is created, the VM
+would call retainObject().
+
+For example, storing an object
+in a variable or a container
+may create a new owning reference.
+
+An important detail is that copying
+a pointer does not always create
+a new owner.
+
+Some references are temporary or
+borrowed, so a complete design must
+define which references contribute
+to the reference count.
+
+## 6. Decrement the Reference Count
+
+The matching operation is releaseObject().
+
+In memory.h:
+
+```c
+void releaseObject(Obj* object);
+```
+
+The basic idea is:
+
+```c
+void releaseObject(Obj* object) {
+  if (object == NULL) return;
+
+  if (object->referenceCount == 0) {
+    // Ownership bookkeeping error.
+    return;
+  }
+
+  object->referenceCount--;
+
+  if (object->referenceCount == 0) {
+    // No tracked owners remain.
+    // Reclaim the object through a
+    // reference-count-aware deallocator.
+  }
+}
+```
+
+This illustrates the reference-counting
+decision without prematurely freeing
+objects.
+
+In a complete implementation,
+releasing an object would also
+release its owned references.
+
+For example, a closure holds
+references to its function and
+upvalues.
+
+Those references would need to
+be released when the closure
+is destroyed.
+
+The object must also be removed
+from vm.objects before it is freed.
+
+Otherwise, the existing mark-and-sweep
+collector could later try to process
+a dangling pointer.
+
+I would not directly call the
+existing freeObject() from this
+example without first implementing
+those ownership and linked-list
+requirements.
+
+## 7. Handling Lox Values
+
+clox stores runtime values using
+the Value representation.
+
+Not every Value contains a pointer.
+
+Numbers, Boolean values, and nil
+do not require reference counting.
+
+Only heap-allocated objects would
+participate.
+
+For example:
+
+```c
+static void retainValue(Value value) {
+  if (IS_OBJ(value)) {
+    retainObject(AS_OBJ(value));
+  }
+}
+```
+
+Similarly:
+
+```c
+static void releaseValue(Value value) {
+  if (IS_OBJ(value)) {
+    releaseObject(AS_OBJ(value));
+  }
+}
+```
+
+These helpers would make it easier
+to manage reference counts for
+objects stored inside Lox values.
+
+However, the entire VM must use
+the same ownership convention.
+
+For example, push(), pop(),
+variable assignment, global table
+updates, and closure creation
+would all need careful handling.
+
+## 8. A Standalone Reference-Counting Example
+
+To demonstrate reference counting
+without relying on an incomplete
+clox integration, I wrote a small
+standalone C example.
+
+This example has a simple object
+that stores a value and a
+reference count.
+
+It is intended as a demonstration
+of the reference-counting algorithm.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct {
+  int value;
+  size_t referenceCount;
+} RCObject;
+
+RCObject* createObject(int value) {
+  RCObject* object = malloc(sizeof(RCObject));
+
+  if (object == NULL) {
+    return NULL;
+  }
+
+  object->value = value;
+  object->referenceCount = 1;
+
+  return object;
+}
+
+void retain(RCObject* object) {
+  if (object != NULL) {
+    object->referenceCount++;
+  }
+}
+
+void release(RCObject* object) {
+  if (object == NULL) return;
+
+  if (object->referenceCount == 0) {
+    fprintf(stderr, "Invalid reference count.\n");
+    abort();
+  }
+
+  object->referenceCount--;
+
+  if (object->referenceCount == 0) {
+    free(object);
+  }
+}
+
+int main(void) {
+  RCObject* first = createObject(42);
+
+  if (first == NULL) {
+    return 1;
+  }
+
+  // A second variable shares the same object.
+  RCObject* second = first;
+  retain(second);
+
+  printf("Value: %d\n", first->value);
+  printf("References: %zu\n",
+         first->referenceCount);
+
+  // Release the first ownership reference.
+  release(first);
+  first = NULL;
+
+  printf("References after release: %zu\n",
+         second->referenceCount);
+
+  // Release the final ownership reference.
+  release(second);
+  second = NULL;
+
+  return 0;
+}
+```
+
+Expected output:
+
+```text
+Value: 42
+References: 2
+References after release: 1
+```
+
+The object is allocated with one
+owning reference.
+
+When second begins sharing it,
+retain() increases the count to two.
+
+Releasing first reduces the count
+to one.
+
+Releasing second reduces the count
+to zero and frees the object.
+
+The example demonstrates how
+reference counting can reclaim
+memory without a separate sweep.
+
+It does not implement the full
+clox object graph or garbage collector.
+
+## 9. Integrating Reference Counting Into clox
+
+To augment the existing clox
+collector, reference tracking
+would need to be added wherever
+owning references are created,
+replaced, or destroyed.
+
+Important areas include:
+
+- VM stack values and temporary roots.
+- Global variables and table entries.
+- Function constant arrays.
+- Closure references to functions.
+- Closure references to upvalues.
+- Closed upvalues containing objects.
+- Compiler-held function objects.
+- The lifetime of active call frames.
+
+For example, when a global variable
+is assigned a new object, the VM
+must keep the new object alive and
+release ownership of the old one.
+
+When a closure is freed, the objects
+it owns must also have their counts
+updated.
+
+Without these changes, reference
+counts could become incorrect.
+
+An incorrect count could cause an
+object to be freed while it is still
+needed, or prevent unused memory
+from being reclaimed.
+
+This is why the standalone example
+is only a starting point.
+
+## 10. The Problem With Cyclic References
+
+One major limitation of reference
+counting is that it cannot reclaim
+certain cyclic object graphs.
+
+Consider two objects:
+
+```text
+Object A references Object B.
+
+Object B references Object A.
+```
+
+Even if the program no longer
+holds a reference to either object,
+each object still has a reference
+from the other.
+
+Conceptually:
+
+```text
+A.referenceCount = 1
+
+B.referenceCount = 1
+```
+
+Neither count reaches zero.
+
+The objects remain allocated,
+even though the program cannot
+access them anymore.
+
+This is a memory leak caused
+by cyclic references.
+
+A tracing collector such as
+mark-and-sweep can reclaim
+the objects because neither
+is reachable from a root.
+
+## 11. Combining Reference Counting With Mark-and-Sweep
+
+Because reference counting has
+difficulty with cycles, I would
+retain the Chapter 26
+mark-and-sweep collector.
+
+The hybrid approach would use
+two complementary mechanisms.
+
+Reference counting could reclaim
+objects when their last owning
+reference disappears.
+
+Mark-and-sweep would periodically
+trace roots to detect remaining
+unreachable objects, including
+cyclic object graphs.
+
+Both mechanisms would need to
+share consistent object metadata
+and deallocation logic.
+
+An object immediately freed by
+reference counting must first
+be removed from the VM's list
+of allocated objects.
+
+Likewise, an object reclaimed
+during sweeping must release
+its owned references without
+causing double-free errors.
+
+This coordination adds complexity.
+
+The proposed hybrid design
+would therefore require more
+changes than simply adding
+a referenceCount field.
+
+## 12. Comparing Garbage Collection Algorithms
+
+| Feature | Mark-and-Sweep | Reference Counting |
+|---|---|---|
+| Basic strategy | Trace roots and free unreachable objects | Count owning references |
+| Reclamation | During collection cycles | Potentially when count reaches zero |
+| Cyclic garbage | Can collect it | Cannot collect it by simple counting alone |
+| Runtime work | Marking and sweeping | Reference-count updates |
+| Additional state | Mark bit, object list, gray stack | Reference count and ownership bookkeeping |
+| Main concern | Collection pauses | Cycles and reference-management overhead |
+
+Mark-and-sweep focuses on
+reachability.
+
+Reference counting focuses
+on how many tracked owners
+an object has.
+
+Neither approach is automatically
+better for every program.
+
+Their costs depend on how
+objects are created, referenced,
+and discarded.
+
+## 13. Performance Considerations
+
+Reference counting can reclaim
+unused objects as soon as their
+reference counts reach zero.
+
+This may reduce the need to
+wait for a full collection.
+
+However, it also requires
+additional bookkeeping
+whenever ownership changes.
+
+Programs that frequently
+copy or replace references
+could spend additional time
+updating counts.
+
+Mark-and-sweep avoids those
+per-reference updates but
+periodically traverses the
+reachable object graph and
+allocated object list.
+
+A hybrid implementation
+would introduce the complexity
+of coordinating both systems.
+
+I have not run benchmarks or
+integrated reference counting
+into clox, so I cannot determine
+whether the hybrid approach
+would improve performance.
+
+## 14. Testing the Proposed Design
+
+I would begin by testing the
+standalone reference-counting
+example.
+
+I would verify that objects
+are freed only after the final
+owning reference is released.
+
+For an integrated clox version,
+I would then test:
+
+1. Objects referenced by multiple
+   variables.
+2. References that are overwritten.
+3. Objects captured by closures.
+4. Objects held in global variables.
+5. Cyclic references between objects.
+6. Garbage collection during
+   allocation and compilation.
+
+I would also use the
+DEBUG_STRESS_GC option
+introduced in Chapter 26.
+
+This would help identify
+objects being freed too early
+or incorrectly retained.
+
+Memory-checking tools could
+also help detect invalid
+accesses and memory leaks.
+
+These are proposed tests.
+They have not been executed.
+
+## 15. Is Reference Counting Worth Using?
+
+I think reference counting
+is interesting because its
+basic idea is relatively
+easy to understand.
+
+An object remains alive while
+references to it exist, and
+its memory can be reclaimed
+when the final owner releases it.
+
+However, applying this idea
+to a language interpreter
+is more complicated than
+the standalone example suggests.
+
+Every owning reference must
+be tracked, and cyclic
+references require a
+separate solution.
+
+I would probably keep
+mark-and-sweep as clox's
+primary collector unless
+testing showed that a
+hybrid approach provided
+a practical advantage.
+
+The original collector
+already handles cyclic
+object graphs, which is
+important for closures
+and more complex objects.
